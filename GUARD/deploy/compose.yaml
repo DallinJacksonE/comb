@@ -1,0 +1,20 @@
+# Example only: select a reviewed coturn release/digest and generate private config first.
+services:
+  coturn:
+    image: "${COTURN_IMAGE:?Set a reviewed pinned coturn/coturn release or digest}"
+    user: "${TURN_UID:?Set host config owner UID}:${TURN_GID:?Set host config owner GID}"
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    command: ["-c", "/run/secrets/turnserver.conf"]
+    secrets:
+      - source: turn_config
+        target: turnserver.conf
+secrets:
+  turn_config:
+    file: "${TURN_CONFIG_FILE:?Set absolute path to validated mode-0600 coturn config}"

@@ -1,0 +1,19 @@
+[package]
+name = "comb-cell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+argon2 = { version = "0.5", features = ["zeroize"] }
+hkdf = "0.12"

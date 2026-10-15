@@ -1,0 +1,20 @@
+[package]
+name = "comb-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "comb_guard"
+
+[dependencies]
+snow = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+libc = "0.2"
+
+[dev-dependencies]

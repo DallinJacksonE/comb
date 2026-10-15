@@ -1,0 +1,10 @@
+/target/
+/FRAME/webgui/node_modules/
+/FRAME/webgui/dist/
+/.hermes/
+*.vault
+*.recovery
+*.cell
+*.enc
+.env
+.env.*

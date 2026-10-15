@@ -1,0 +1,11 @@
+import { useState } from 'react';
+import type { Cell, Issue } from '../service/contracts';
+import type { AdminPresenter } from '../presenter/AdminPresenter';
+export function CellDetail({ cell, issues, presenter: p, origin, busy }: { cell: Cell; issues: Issue[]; presenter: AdminPresenter; origin: string; busy: boolean }) {
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  return <div className="detail inset"><dl className="metadata"><div><dt>Owner</dt><dd>{cell.owner}</dd></div><div><dt>Version</dt><dd>{cell.version}</dd></div></dl><label htmlFor={`remote-${cell.id}`}>Git remote URL</label><input id={`remote-${cell.id}`} readOnly value={`${origin}/git/${cell.id}.git`} onFocus={e => e.target.select()} /><p className="fine">Git credentials: use your management token as the password in this prototype. Never embed it in a remote URL.</p><h3>References</h3><Records values={cell.refs} empty="No references yet. Push a commit using Git." /><h3>Members</h3><Records values={cell.members} empty="No members reported." /><h3>Issues <span className="count">{issues.length}</span></h3>{!issues.length && <p className="muted">No issues yet.</p>}<ul className="issue-list">{issues.map(issue => <li key={issue.id}><span className="pill">{issue.closed ? 'Closed' : 'Open'}</span><strong>{issue.title}</strong><p className="body-text">{issue.body}</p><small className="muted">{issue.id}</small></li>)}</ul><form onSubmit={async e => { e.preventDefault(); if (await p.createIssue(title, body)) { setTitle(''); setBody(''); } }}><h3>New issue</h3><label htmlFor="issue-title">Title</label><input id="issue-title" required value={title} onChange={e => setTitle(e.target.value)} /><label htmlFor="issue-body">Description</label><textarea id="issue-body" rows={3} value={body} onChange={e => setBody(e.target.value)} /><button disabled={busy}>Create issue</button></form></div>;
+}
+function Records({ values, empty }: { values: Record<string, string>; empty: string }) {
+  return Object.keys(values).length ? <dl className="records">{Object.entries(values).map(([key, value]) => <div key={key}><dt>{key}</dt><dd><code>{value}</code></dd></div>)}</dl> : <p className="muted">{empty}</p>;
+}
