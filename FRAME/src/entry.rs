@@ -1,6 +1,7 @@
 //! CLI execution. All domain/network behavior uses the shared library services.
 use crate::cli::{CellCommand, Cli, Command, Enrollment, IceCommand, PeerCommand};
 use anyhow::{Context, Result, bail};
+use clap::CommandFactory;
 
 use comb_frame::{identity, snapshot::Snapshot, store::Store};
 use serde::{Serialize, de::DeserializeOwned};
@@ -17,64 +18,177 @@ pub async fn run() -> Result<()> {
         .init();
     let cli = Cli::parse_compatible_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let data = cli.data.clone().unwrap_or_else(default_data);
-    match cli.command.unwrap_or(Command::User {
+    let show_help = cli.command.is_none();
+    if show_help && data.join("node.vault").exists() {
+        Cli::command().print_help()?;
+        return Ok(());
+    }
+    let command = cli.command.unwrap_or(Command::User {
+        username: None,
+        ssh_config: None,
+        ssh_listen: None,
         name: None,
         email: None,
         recovery: None,
-    }) {
+    });
+    let mut cached_password = crate::onboarding::prepare(&data, &command).await?;
+    if show_help {
+        Cli::command().print_help()?;
+        return Ok(());
+    }
+    let session = if matches!(
+        &command,
+        Command::ServiceStatus
+            | Command::Serve { .. }
+            | Command::Enroll { .. }
+            | Command::Recover { .. }
+            | Command::Ice { .. }
+            | Command::Ssh { .. }
+    ) {
+        None
+    } else {
+        comb_frame::managed::session(&data).await?
+    };
+    match command {
+        Command::Ssh { action } => crate::cli_ssh::run(&data, action)?,
+        Command::ServiceStatus => {
+            let state = comb_frame::managed::status(&data)
+                .await?
+                .context("Managed FRAME control socket is not ready")?;
+            print_json(&serde_json::json!({"state": state}))?;
+        }
         Command::User {
             name,
             email,
             recovery,
+            username,
+            ssh_config,
+            ssh_listen,
         } => {
-            let password = password("FRAME password: ")?;
-            if data.join("node.vault").exists() {
-                print_json(&identity::load(&data, &password)?.profile)?;
-            } else {
-                let name = match name {
-                    Some(v) => v,
-                    None => prompt("Name: ")?,
-                };
-                let email = match email {
-                    Some(v) => v,
-                    None => prompt("Email: ")?,
-                };
-                let recovery = recovery.unwrap_or_else(|| data.join("identity.recovery"));
-                let local = identity::initialize(&data, &name, &email, &password, &recovery)?;
-                print_json(&local.profile)?;
-                eprintln!(
-                    "Encrypted recovery file: {}. Store it safely offline; COMB cannot replace it.",
-                    recovery.display()
-                );
+            if session.is_some() {
+                print_json(
+                    &comb_frame::managed::profile(&data)
+                        .await?
+                        .context("FRAME session ended before reading profile")?,
+                )?;
+                return Ok(());
             }
+            let local = if data.join("node.vault").exists() {
+                crate::onboarding::unlock_local(
+                    &mut cached_password,
+                    "FRAME password: ",
+                    |secret| identity::load(&data, secret),
+                )?
+                .1
+            } else {
+                let secret = crate::onboarding::initialize(
+                    &data,
+                    crate::onboarding::Options {
+                        name,
+                        email,
+                        recovery,
+                        username,
+                        ssh_config,
+                        ssh_listen,
+                    },
+                )?;
+                identity::load(&data, &secret)?
+            };
+            print_json(&local.profile)?;
         }
         Command::Serve {
+            managed,
             listen,
             peer_listen,
+            ssh_listen,
             assets,
             sync_seconds,
+            web_listen,
+            web_origin,
+            tls_cert,
+            tls_key,
+            web_behind_proxy,
         } => {
-            let password = password("Unlock FRAME: ")?;
-            let store = Store::open(&data, &password)?;
-            comb_frame::daemon::run(store, listen, peer_listen, assets, sync_seconds).await?;
+            let web = match (web_listen, web_origin) {
+                (Some(listen), Some(origin)) => {
+                    let config = comb_frame::web_host::Config {
+                        listen,
+                        origin,
+                        tls_cert,
+                        tls_key,
+                        behind_proxy: web_behind_proxy,
+                    };
+                    config.validate()?;
+                    Some(config)
+                }
+                (None, None) => None,
+                _ => bail!("--web-listen and --web-origin are required together"),
+            };
+            if managed {
+                comb_frame::managed::run(comb_frame::managed::Config {
+                    data,
+                    listen,
+                    peer_listen,
+                    ssh_listen,
+                    assets,
+                    sync_seconds,
+                    web,
+                })
+                .await?;
+            } else {
+                let (_, store) = crate::onboarding::unlock_local(
+                    &mut cached_password,
+                    "Unlock FRAME: ",
+                    |secret| Store::open(&data, secret),
+                )?;
+                comb_frame::daemon::run_with_web(
+                    store,
+                    listen,
+                    peer_listen,
+                    assets,
+                    sync_seconds,
+                    ssh_listen,
+                    web,
+                )
+                .await?;
+            }
         }
         Command::Token => {
-            let password = password("Unlock FRAME: ")?;
-            println!("{}", identity::load(&data, &password)?.token);
+            if let Some(session) = session {
+                println!("{}", *session.token);
+            } else {
+                let (_, local) = crate::onboarding::unlock_local(
+                    &mut cached_password,
+                    "Unlock FRAME: ",
+                    |secret| identity::load(&data, secret),
+                )?;
+                println!("{}", local.token);
+            }
         }
         Command::Profile { out } => {
-            let password = password("Unlock FRAME: ")?;
-            let local = identity::load(&data, &password)?;
-            if let Some(out) = out {
-                write_json(&out, &local.profile)?;
+            let profile = if session.is_some() {
+                comb_frame::managed::profile(&data)
+                    .await?
+                    .context("FRAME session ended before reading profile")?
             } else {
-                print_json(&local.profile)?;
+                crate::onboarding::unlock_local(&mut cached_password, "Unlock FRAME: ", |secret| {
+                    identity::load(&data, secret)
+                })?
+                .1
+                .profile
+                .clone()
+            };
+            if let Some(out) = out {
+                write_json(&out, &profile)?;
+            } else {
+                print_json(&profile)?;
             }
         }
         Command::Enroll { action } => {
             let password = password("FRAME password: ")?;
             match action {
                 Enrollment::Request { out } => {
+                    crate::onboarding::validate_new_password(&password)?;
                     write_json(&out, &identity::prepare_enrollment(&data, &password)?)?
                 }
                 Enrollment::Authorize { request, out } => write_json(
@@ -85,6 +199,7 @@ pub async fn run() -> Result<()> {
                     grant,
                     identity_key,
                 } => {
+                    crate::onboarding::validate_new_password(&password)?;
                     let grant: identity::EnrollmentGrant = read_json(&grant)?;
                     check_identity_pin(&identity_key, &grant.identity)?;
                     print_json(
@@ -100,6 +215,7 @@ pub async fn run() -> Result<()> {
             owner_key,
         } => {
             let password = password("New FRAME password: ")?;
+            crate::onboarding::validate_new_password(&password)?;
             let recovery_password = Zeroizing::new(match std::env::var("COMB_RECOVERY_PASSWORD") {
                 Ok(v) => v,
                 Err(_) => rpassword::prompt_password("Recovery-file password: ")?,
@@ -132,16 +248,30 @@ pub async fn run() -> Result<()> {
                 &serde_json::json!({"server":address.to_string(),"mapped_address":mapped.to_string()}),
             )?;
         }
-        command => online(&data, &cli.api_url, command).await?,
+        command => online(&data, &cli.api_url, command, cached_password, session).await?,
     }
     Ok(())
 }
-async fn online(data: &Path, url: &str, command: Command) -> Result<()> {
-    let password = password("Unlock local FRAME: ")?;
-    let token = Zeroizing::new(match std::env::var("COMB_TOKEN") {
-        Ok(v) => v,
-        Err(_) => identity::load(data, &password)?.token.clone(),
-    });
+async fn online(
+    data: &Path,
+    url: &str,
+    command: Command,
+    mut cached: Option<Zeroizing<Vec<u8>>>,
+    session: Option<comb_frame::managed::Session>,
+) -> Result<()> {
+    let token = if let Ok(token) = std::env::var("COMB_TOKEN") {
+        Zeroizing::new(token)
+    } else if let Some(session) = session {
+        session.token
+    } else {
+        let (password, local) =
+            crate::onboarding::unlock_local(&mut cached, "Unlock local FRAME: ", |secret| {
+                identity::load(data, secret)
+            })?;
+        let token = Zeroizing::new(local.token.clone());
+        cached = Some(password);
+        token
+    };
     let base = local_api_url(url)?;
     let result = match command {
         Command::Cell { action } => match action {
@@ -295,6 +425,10 @@ async fn online(data: &Path, url: &str, command: Command) -> Result<()> {
                 );
                 return Ok(());
             } else if let Some(out) = request_out {
+                let password = crate::onboarding::take_password(
+                    &mut cached,
+                    "FRAME password for restore request: ",
+                )?;
                 write_json(
                     &out,
                     &request(
@@ -308,6 +442,10 @@ async fn online(data: &Path, url: &str, command: Command) -> Result<()> {
                 )?;
                 return Ok(());
             } else {
+                let password = crate::onboarding::take_password(
+                    &mut cached,
+                    "FRAME password for restored state: ",
+                )?;
                 let credential = Zeroizing::new(match credential {
                     Some(v) => v,
                     None => rpassword::prompt_password("Restore credential: ")?,
@@ -340,12 +478,15 @@ async fn online(data: &Path, url: &str, command: Command) -> Result<()> {
     print_json(&result)
 }
 fn default_data() -> PathBuf {
+    if let Some(path) = std::env::var_os("COMB_DATA_DIR") {
+        return PathBuf::from(path);
+    }
     if let Some(path) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(path).join("comb");
     }
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share/comb")
 }
-fn password(message: &str) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn password(message: &str) -> Result<Zeroizing<Vec<u8>>> {
     let value = match std::env::var("COMB_PASSWORD") {
         Ok(value) => value,
         Err(_) => rpassword::prompt_password(message)?,
@@ -355,7 +496,7 @@ fn password(message: &str) -> Result<Zeroizing<Vec<u8>>> {
     }
     Ok(Zeroizing::new(value.into_bytes()))
 }
-fn prompt(message: &str) -> Result<String> {
+pub(crate) fn prompt(message: &str) -> Result<String> {
     eprint!("{message}");
     io::stderr().flush()?;
     let mut value = String::new();

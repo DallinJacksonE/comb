@@ -1,3 +1,4 @@
+//! Domain-separated signed payloads with certificate and content-ID bindings.
 use crate::{
     Error, FrameCertificate, FramePublic, FrameSecrets, IdentityPublic, Result, Signature,
     certificate_bytes, message,
@@ -10,13 +11,21 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignedRecord {
+    /// Signed-record wire version; currently 1.
     pub version: u32,
+    /// Signer’s complete identity/device certificate binding.
     pub certificate: FrameCertificate,
+    /// Application-selected payload purpose, authenticated by the record signature.
     pub domain: Vec<u8>,
+    /// Exact application bytes; signed but not encrypted.
     pub payload: Vec<u8>,
+    /// Device signature over the complete record signing encoding.
     pub signature: Signature,
 }
 impl SignedRecord {
+    /// Sign exact payload bytes after checking the certificate chain and device keys.
+    /// The embedded identity is checked internally, not externally pinned: callers
+    /// must authorize the certificate and domain before issuing a record.
     pub fn new(
         frame: &FrameSecrets,
         certificate: &FrameCertificate,
@@ -37,6 +46,7 @@ impl SignedRecord {
         record.signature = frame.sign(b"signed-record", &record.signing_bytes());
         Ok(record)
     }
+    /// Encode the version, key binding, certificate signature, domain, and payload.
     fn signing_bytes(&self) -> Vec<u8> {
         message(
             b"record-fields",

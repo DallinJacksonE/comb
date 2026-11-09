@@ -9,65 +9,104 @@ use std::collections::{BTreeMap, BTreeSet};
 const GENESIS: &[u8] = b"comb.cell.genesis.v1";
 const EVENT: &[u8] = b"comb.cell.event.v1";
 
+/// Identity-level read or write membership in a CELL.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// May read and perform the permitted own-device enrollment operations.
     Read,
+    /// May additionally publish data and reconcile pending data contributions.
     Write,
 }
 
+/// Minimal issue register value; repeated IDs replace values during replay.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Issue {
+    /// Application-selected issue identifier.
     pub id: String,
+    /// Issue title.
     pub title: String,
+    /// Issue body.
     pub body: String,
+    /// Whether the issue is closed.
     pub closed: bool,
 }
 
+/// Signed metadata change, authorized against policy at its causal parents.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub enum Operation {
+    /// Owner-only name change.
+    Rename {
+        /// New name: nonblank, at most 120 UTF-8 bytes, with no control characters.
+        name: String,
+    },
+    /// Owner-only membership grant or role update.
     Grant {
+        /// Full public identity binding to grant membership.
         identity: IdentityPublic,
+        /// New membership role.
         role: Role,
     },
+    /// Owner-only removal of an identity’s CELL rights.
     Revoke {
+        /// Signing-key identifier of the member to remove.
         identity_id: String,
     },
+    /// Register a member’s certified device under the causal enrollment policy.
     RegisterFrame {
+        /// Complete certificate of the device to register.
         certificate: FrameCertificate,
     },
+    /// Permanently deny a device within this CELL.
     RevokeFrame {
+        /// Signing-key identifier of the device to revoke.
         frame_id: String,
     },
+    /// Apply partial opaque Git ref updates; `refs/comb/` is reserved.
     Publish {
+        /// Partial map of ref names to opaque object identifiers.
         refs: BTreeMap<String, String>,
     },
+    /// Insert or replace an issue by its identifier.
     AddIssue {
+        /// Complete issue value to insert or replace.
         issue: Issue,
     },
+    /// Accept an exact list of causally visible pending data versions.
     Adopt {
+        /// Exact, nonempty, duplicate-free list of pending data versions.
         version_ids: Vec<String>,
     },
+    /// Exclude an exact list of causally visible pending data versions.
     Exclude {
+        /// Exact, nonempty, duplicate-free list of pending data versions.
         version_ids: Vec<String>,
     },
 }
 
+/// Serializable signed metadata history. Deserialization does not validate trust.
+/// Call `validate` before consuming public fields; projections replay signed history.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cell {
+    /// Genesis signed-record content identifier.
     pub id: String,
+    /// Original genesis name; use `effective_name` for accepted renames.
     pub name: String,
+    /// Immutable public identity that owns this CELL.
     pub owner: IdentityPublic,
     genesis: SignedRecord,
     versions: BTreeMap<String, SignedRecord>,
 }
 
+/// Result of a validated union of two histories sharing the same genesis.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MergeReport {
+    /// Newly received records that are neither pending nor excluded.
     pub accepted: usize,
+    /// All currently quarantined version IDs in sorted order.
     pub pending: Vec<String>,
 }
 
@@ -92,6 +131,7 @@ struct Graph {
     events: BTreeMap<String, Event>,
     ancestors: BTreeMap<String, BTreeSet<String>>,
 }
+/// Reject changes to an already pinned identity or device binding.
 fn bind<T: PartialEq>(map: &mut BTreeMap<String, T>, id: String, value: T) -> Result<()> {
     if map.get(&id).is_some_and(|old| old != &value) {
         return Err(Error::Authentication);
@@ -108,6 +148,7 @@ struct Classification {
 
 #[derive(Default)]
 struct View {
+    name: String,
     members: BTreeMap<String, Role>,
     identities: BTreeMap<String, IdentityPublic>,
     frames: BTreeMap<String, FrameCertificate>,
@@ -118,20 +159,26 @@ struct View {
     excluded: BTreeSet<String>,
 }
 
+/// Lowercase hex Ed25519 identity key; does not include the recovery key.
 pub fn identity_id(identity: &IdentityPublic) -> String {
     hex::encode(identity.signing_key)
 }
+/// Lowercase hex Ed25519 device key; does not include the recipient key.
 pub fn frame_id(frame: &FramePublic) -> String {
     hex::encode(frame.signing_key)
 }
+/// Serialize through a JSON value to obtain this workspace configuration’s sorted keys.
 fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&serde_json::to_value(value)?)?)
 }
+/// Encode the signed record content hash as lowercase hexadecimal.
 fn record_id(record: &SignedRecord) -> Result<String> {
     Ok(hex::encode(record.id()?))
 }
 
 impl Cell {
+    /// Create a randomly distinguished signed genesis owned by the certificate identity.
+    /// Caller supplies the trusted owner certificate; creation does not externally pin it.
     pub fn create(name: String, frame: &FrameSecrets, cert: &FrameCertificate) -> Result<Self> {
         let genesis = SignedRecord::new(
             frame,
@@ -151,6 +198,7 @@ impl Cell {
             versions: BTreeMap::new(),
         })
     }
+    /// Collect DAG records not referenced as parents, including genesis for an empty history.
     fn tips(&self) -> BTreeSet<String> {
         let mut tips: BTreeSet<_> = self.versions.keys().cloned().collect();
         tips.insert(self.id.clone());
@@ -163,11 +211,14 @@ impl Cell {
         }
         tips
     }
+    /// Hash the sorted current DAG tips; this identifier alone does not validate history.
     pub fn version_id(&self) -> String {
         hex::encode(Sha256::digest(
             canonical(&self.tips()).expect("string serialization"),
         ))
     }
+    /// Sign an operation descending from all current tips and validate the candidate.
+    /// Returns the new record ID; leaves this CELL unchanged on failure.
     pub fn apply(
         &mut self,
         op: Operation,
@@ -192,6 +243,8 @@ impl Cell {
         *self = candidate;
         Ok(id)
     }
+    /// Validate and union a peer history with the same exact genesis.
+    /// Commits only a valid candidate; pending contributions remain in history.
     pub fn merge(&mut self, other: &Cell) -> Result<MergeReport> {
         self.validate()?;
         if self.id != other.id
@@ -225,9 +278,12 @@ impl Cell {
         *self = candidate;
         Ok(report)
     }
+    /// Validate genesis, record encodings, graph structure, signatures, and causal policy.
+    /// Does not prove freshness, persistence completeness, or validity of opaque Git objects.
     pub fn validate(&self) -> Result<()> {
         self.view().map(|_| ())
     }
+    /// Validate canonical records and build causal order before checking each operation.
     fn graph(&self) -> Result<Graph> {
         let genesis: Genesis = serde_json::from_slice(self.genesis.verify(
             &self.owner,
@@ -310,6 +366,17 @@ impl Cell {
                 return Err(Error::Authentication);
             }
             match &event.operation {
+                Operation::Rename { name } => {
+                    if !owner {
+                        return Err(Error::Authentication);
+                    }
+                    if name.trim().is_empty()
+                        || name.len() > 120
+                        || name.chars().any(char::is_control)
+                    {
+                        return Err(Error::Format);
+                    }
+                }
                 Operation::Grant { identity, .. } => {
                     if !owner || identity_id(identity) == identity_id(&self.owner) {
                         return Err(Error::Authentication);
@@ -376,6 +443,7 @@ impl Cell {
         }
         Ok(graph)
     }
+    /// Replay selected policy events; concurrent revocation or read grants win.
     fn policy(&self, graph: &Graph, selected: &BTreeSet<String>) -> View {
         let mut view = View::default();
         view.members.insert(identity_id(&self.owner), Role::Write);
@@ -434,6 +502,7 @@ impl Cell {
         }
         view
     }
+    /// Quarantine stale concurrent work and apply causally valid reconciliation decisions.
     fn classify(&self, graph: &Graph, selected: &BTreeSet<String>) -> Classification {
         let mut result = Classification::default();
         let mut decisions: Vec<(String, String, bool)> = Vec::new();
@@ -526,6 +595,7 @@ impl Cell {
         }
         result
     }
+    /// Reconstruct validated policy and accepted data projections from signed history.
     fn view(&self) -> Result<View> {
         let graph = self.graph()?;
         // A decision must have been valid with exactly the causal evidence it signed.
@@ -559,11 +629,14 @@ impl Cell {
             .cloned()
             .collect();
         let mut view = self.policy(&graph, &accepted);
+        view.name = self.name.clone();
         view.pending = classification.pending;
         view.excluded = classification.excluded;
         let mut ref_updates: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for id in graph.order.iter().filter(|id| accepted.contains(*id)) {
             match &graph.events[id].operation {
+                // Causal order wins; concurrent owner renames use deterministic DAG order.
+                Operation::Rename { name } => view.name = name.clone(),
                 Operation::Publish { refs } => {
                     for (name, value) in refs {
                         ref_updates
@@ -601,31 +674,49 @@ impl Cell {
         }
         Ok(view)
     }
+    /// Replay accepted renames; falls back to the genesis name if validation fails.
+    pub fn effective_name(&self) -> String {
+        self.view()
+            .map(|v| v.name)
+            .unwrap_or_else(|_| self.name.clone())
+    }
+    /// Return current accepted membership, or an empty map on invalid history.
     pub fn members(&self) -> BTreeMap<String, Role> {
         self.view().map(|v| v.members).unwrap_or_default()
     }
+    /// Return historical identity bindings, or an empty map on invalid history.
+    /// Includes former members; this map alone is not an encryption recipient policy.
     pub fn identities(&self) -> BTreeMap<String, IdentityPublic> {
         self.view().map(|v| v.identities).unwrap_or_default()
     }
+    /// Return historical certificates, including revoked devices, or an empty map on error.
     pub fn frames(&self) -> BTreeMap<String, FrameCertificate> {
         self.view().map(|v| v.frames).unwrap_or_default()
     }
+    /// Project accepted partial ref updates, preserving divergence under `refs/comb/`.
+    /// Returns an empty map if history is invalid; values are opaque to CELL.
     pub fn refs(&self) -> BTreeMap<String, String> {
         self.view().map(|v| v.refs).unwrap_or_default()
     }
+    /// Return accepted issues sorted by ID, or an empty list on invalid history.
     pub fn issues(&self) -> Vec<Issue> {
         self.view()
             .map(|v| v.issues.into_values().collect())
             .unwrap_or_default()
     }
+    /// Return permanently revoked device IDs, or an empty set on invalid history.
     pub fn revoked_frames(&self) -> BTreeSet<String> {
         self.view().map(|v| v.revoked).unwrap_or_default()
     }
+    /// Return sorted quarantined version IDs, or an empty list on invalid history.
     pub fn pending(&self) -> Vec<String> {
         self.view()
             .map(|v| v.pending.into_iter().collect())
             .unwrap_or_default()
     }
+    /// Check exact registered certificate, membership, and device revocation.
+    /// With `write`, additionally require write membership. Invalid history returns false.
+    /// This is CELL-local policy, not global lifecycle or enrollment authorization.
     pub fn is_frame_authorized(&self, cert: &FrameCertificate, write: bool) -> bool {
         self.view().is_ok_and(|v| {
             v.frames.get(&frame_id(&cert.frame)) == Some(cert)

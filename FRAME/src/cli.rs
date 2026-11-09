@@ -40,8 +40,19 @@ pub struct Cli {
 }
 #[derive(Subcommand)]
 pub enum Command {
+    /// Private installer readiness probe; never initializes or unlocks.
+    #[command(hide = true)]
+    ServiceStatus,
     /// Initialize a self-custodied identity and first FRAME.
     User {
+        /// SSH login name; independent of display name and email.
+        #[arg(long)]
+        username: Option<String>,
+        /// Select the dedicated COMB client alias configuration destination.
+        #[arg(long)]
+        ssh_config: Option<PathBuf>,
+        #[arg(long)]
+        ssh_listen: Option<SocketAddr>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -51,17 +62,48 @@ pub enum Command {
     },
     /// Run the daemon, standard Git remote, GUI, and encrypted peer endpoint.
     Serve {
+        /// Wait locked for a private local initialization/unlock request (user service).
+        #[arg(long)]
+        managed: bool,
         #[arg(long, default_value = "127.0.0.1:7331")]
         listen: SocketAddr,
         #[arg(long, default_value = "127.0.0.1:7332")]
         peer_listen: SocketAddr,
+        /// SSH bind override; saved setup defaults to 127.0.0.1:7333.
+        #[arg(long)]
+        ssh_listen: Option<SocketAddr>,
         #[arg(long, default_value = "FRAME/webgui/dist")]
         assets: PathBuf,
         #[arg(long, default_value_t = 0)]
         sync_seconds: u64,
+        /// Separate remote administration listener; never forward the local --listen port.
+        #[arg(long, requires = "web_origin")]
+        web_listen: Option<SocketAddr>,
+        /// Browser-visible HTTPS origin, e.g. https://code.example.com.
+        #[arg(long, requires = "web_listen")]
+        web_origin: Option<String>,
+        /// PEM certificate chain for direct HTTPS (no automatic CA selection).
+        #[arg(
+            long,
+            requires = "web_listen",
+            requires = "tls_key",
+            conflicts_with = "web_behind_proxy"
+        )]
+        tls_cert: Option<PathBuf>,
+        /// Private PEM key for direct HTTPS; readable only by the service user.
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+        /// Explicit TLS-terminating proxy/tunnel mode; web listener must bind loopback.
+        #[arg(long, requires = "web_listen")]
+        web_behind_proxy: bool,
     },
     /// Print the local management token (treat as a secret).
     Token,
+    /// Configure FRAME SSH keys and the dedicated OpenSSH client alias.
+    Ssh {
+        #[command(subcommand)]
+        action: SshCommand,
+    },
     /// Export the public signed FRAME profile, never private keys.
     Profile {
         #[arg(long)]
@@ -112,6 +154,26 @@ pub enum Command {
         action: IceCommand,
     },
 }
+#[derive(Subcommand)]
+pub enum SshCommand {
+    /// Add SSH access to an existing FRAME without replacing its identity or cells.
+    Setup {
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        ssh_config: Option<PathBuf>,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+    },
+    /// Install/update the client alias for an already generated SSH key.
+    Configure {
+        #[arg(long)]
+        ssh_config: Option<PathBuf>,
+    },
+    /// Display public SSH configuration; never prints a private key.
+    Status,
+}
+
 #[derive(Subcommand)]
 pub enum Enrollment {
     Request {

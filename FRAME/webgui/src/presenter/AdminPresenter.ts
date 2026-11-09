@@ -1,26 +1,34 @@
+/** Framework-free dashboard orchestration; React observes immutable state snapshots. */
 import type { AdminService, Cell, Issue, Peer, Status } from '../service/contracts';
+/** Dashboard snapshot; detail/issues support the inline detail workflow as well. */
 export interface AdminState { busy: boolean; status: Status | null; cells: Cell[]; peers: Peer[]; error: string; detail: Cell | null; issues: Issue[] }
+/** Produce a fresh disconnected snapshot without retaining previously loaded data. */
 const empty = (): AdminState => ({ busy: false, status: null, cells: [], peers: [], error: '', detail: null, issues: [] });
+/** Validate dashboard actions and expose success booleans for draft-reset decisions. */
 export class AdminPresenter {
+  /** Current snapshot; subscribers must read again after each notification. */
   state = empty();
   private listeners = new Set<() => void>();
+  /** Inject the API boundary, or a fake for presenter tests. */
   constructor(private service: AdminService) {}
+  /** Observe snapshot changes; the returned callback removes this subscription. */
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
+  /** Replace the snapshot and synchronously notify all observers. */
   private update(patch: Partial<AdminState>) { this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener()); }
-  async connect(token: string) {
-    if (!token.trim()) { this.update({ error: 'Enter your local management token.' }); return false; }
-    this.service.setToken(token.trim());
+  /** Load status and lists together; ignore duplicate busy calls and clear data on failure. */
+  async connect() {
+    if (this.state.busy) return false;
     this.update({ busy: true, error: '' });
     try {
       const [status, cells, peers] = await Promise.all([this.service.status(), this.service.cells(), this.service.peers()]);
       this.update({ status, cells, peers, busy: false });
       return true;
     } catch (error) {
-      this.disconnect();
-      this.update({ error: error instanceof Error ? error.message : 'Connection failed.' });
+      this.update({ ...empty(), error: error instanceof Error ? error.message : 'Connection failed.' });
       return false;
     }
   }
+  /** Serialize dashboard actions, surface errors, and always release the busy flag. */
   private async run(action: () => Promise<void>) {
     if (this.state.busy) return false;
     this.update({ busy: true, error: '' });
@@ -28,6 +36,7 @@ export class AdminPresenter {
     catch (error) { this.update({ error: error instanceof Error ? error.message : 'Request failed.' }); return false; }
     finally { this.update({ busy: false }); }
   }
+  /** Trim a required name and merge the server-created repository into the list. */
   async createCell(name: string) {
     if (!name.trim()) { this.update({ error: 'Repository name is required.' }); return false; }
     return this.run(async () => {
@@ -36,6 +45,7 @@ export class AdminPresenter {
       this.update({ cells, status: this.state.status ? { ...this.state.status, cells: cells.length } : null });
     });
   }
+  /** Toggle inline details, loading repository metadata and issues when opening. */
   async openCell(id: string) {
     if (this.state.detail?.id === id) { this.update({ detail: null, issues: [] }); return true; }
     this.update({ detail: null, issues: [] });
@@ -44,6 +54,7 @@ export class AdminPresenter {
       this.update({ detail, issues });
     });
   }
+  /** Append a server-created issue to the selected inline repository. */
   async createIssue(title: string, body: string) {
     const id = this.state.detail?.id;
     if (!id || !title.trim()) { this.update({ error: 'Select a repository and enter an issue title.' }); return false; }
@@ -52,6 +63,7 @@ export class AdminPresenter {
       this.update({ issues: [...this.state.issues, issue] });
     });
   }
+  /** Register complete HTTP(S) peer metadata; this does not establish connectivity or trust. */
   async createPeer(input: Peer) {
     const peer = { id: input.id.trim(), url: input.url.trim(), public_key: input.public_key.trim() };
     let validUrl = false;
@@ -62,5 +74,4 @@ export class AdminPresenter {
       this.update({ peers: [...this.state.peers.filter(item => item.id !== saved.id), saved] });
     });
   }
-  disconnect() { this.service.setToken(''); this.update(empty()); }
 }

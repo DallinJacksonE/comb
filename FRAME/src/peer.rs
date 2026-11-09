@@ -1,4 +1,10 @@
 //! Pinned end-to-end Noise sessions over an untrusted HTTP carrier.
+//!
+//! The public identity endpoint is discovery, not trust establishment: callers
+//! must pin a verified peer profile separately. Each handshake permits one
+//! encrypted request/reply within 60 seconds. HTTP still exposes routing, timing,
+//! and message sizes; repository authorization is enforced by the store, not by
+//! possession of a session ID alone.
 use crate::{
     api::{ApiError, App, http_client},
     identity::Profile,
@@ -24,55 +30,78 @@ use std::{
 const MAX_EXCHANGE: usize = 48 * 1024 * 1024;
 const REVOCATION_DOMAIN: &[u8] = b"comb.frame.revoke.v1";
 
+/// Application operation carried inside an authenticated Noise exchange.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PeerRequest {
+    /// Request snapshots visible to the pinned peer's FRAME certificate.
     Pull,
+    /// Import signed snapshots; a previously unknown CELL must belong to the peer.
     Push { snapshots: Vec<Snapshot> },
+    /// Ask a same-identity FRAME to lock itself using a signed lifecycle notice.
     Revoke { notice: Box<SignedRecord> },
 }
+/// Encrypted application reply; HTTP success can still contain `Failure`.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum PeerResponse {
+    /// Snapshots selected for the requesting certificate.
     Snapshots { snapshots: Vec<Snapshot> },
+    /// The operation completed without a snapshot payload.
     Ack,
+    /// Application rejection, serialized inside the authenticated channel.
     Failure { message: String },
 }
+/// Snapshot counts for a completed pull-then-push synchronization.
 #[derive(Serialize, Deserialize)]
 pub struct SyncReport {
+    /// Imported snapshots, excluding locally deleted CELLs (not a change count).
     pub received: usize,
+    /// Snapshots offered to the peer in the subsequent push.
     pub sent: usize,
 }
+/// Cleartext handshake routing hint and base64-encoded initial Noise message.
 #[derive(Serialize, Deserialize)]
 struct Hello {
+    /// Lookup key for a previously pinned peer, not an authentication assertion.
     peer_id: String,
     message: String,
 }
+/// Cleartext session handle and base64-encoded responder handshake message.
 #[derive(Serialize, Deserialize)]
 struct Welcome {
     session_id: String,
     message: String,
 }
+/// Single-use session handle with ordered base64 Noise ciphertext chunks.
 #[derive(Serialize, Deserialize)]
 struct Packet {
     session_id: String,
     chunks: Vec<String>,
 }
+/// Ordered ciphertext chunks for the sole reply on a session.
 #[derive(Serialize, Deserialize)]
 struct Reply {
     chunks: Vec<String>,
 }
+/// In-memory authenticated transport, pinned principal, and absolute expiry origin.
 struct Session {
     transport: SecureSession,
     peer: Peer,
     created: Instant,
 }
+/// Router-local session registry shared by all clones of this router's state.
 #[derive(Clone)]
 struct PeerApp {
     app: App,
     sessions: Arc<Mutex<BTreeMap<String, Session>>>,
 }
 
+/// Build identity/handshake/exchange routes with a 96 MiB HTTP body cap.
+///
+/// Creates a fresh registry (at most 64 live handshakes). This router is not an
+/// admin API: the handshake authenticates pinned peers and store policy gates
+/// individual operations. Mount it only where peer transport is intended.
 pub fn peer_router(app: App) -> Router {
     Router::new()
         .route("/identity", get(profile))
@@ -84,9 +113,14 @@ pub fn peer_router(app: App) -> Router {
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
         })
 }
+/// Publish the local public profile without requiring peer authentication.
 async fn profile(State(state): State<PeerApp>) -> Result<Json<Profile>, ApiError> {
     Ok(Json(state.app.execute(|s| Ok(s.profile().clone())).await?))
 }
+/// Authenticate an active store's pinned peer and allocate a single-use session.
+///
+/// Rejects malformed base64/pins/Noise messages or exhausted capacity; expired
+/// entries are pruned here rather than by a background timer.
 async fn handshake(
     State(state): State<PeerApp>,
     Json(hello): Json<Hello>,
@@ -130,6 +164,10 @@ async fn handshake(
         message: STANDARD.encode(response),
     }))
 }
+/// Consume a session before decoding, then encrypt an application reply.
+///
+/// Even malformed requests consume the handle. Expiry, decoding, and serialization
+/// failures become API errors; processing failures become encrypted `Failure`s.
 async fn receive(
     State(state): State<PeerApp>,
     Json(packet): Json<Packet>,
@@ -156,6 +194,11 @@ async fn receive(
         chunks: encode(&mut session.transport, &plain)?,
     }))
 }
+/// Apply a peer operation through the serialized store boundary.
+///
+/// Snapshot imports can persist before a later item fails; the batch is not a
+/// transaction. Revocation requires the same identity, a valid targeted signature,
+/// and an issuer not locally revoked in any CELL, then persists a FRAME lock.
 async fn process(app: &App, peer: Peer, request: PeerRequest) -> Result<PeerResponse> {
     match request {
         PeerRequest::Pull => {
@@ -169,11 +212,13 @@ async fn process(app: &App, peer: Peer, request: PeerRequest) -> Result<PeerResp
         PeerRequest::Push { snapshots } => {
             app.execute(move |s| {
                 for snapshot in snapshots {
-                    let owner = snapshot.context()?.owner;
+                    let context = snapshot.context()?;
+                    if s.is_cell_deleted(&context.cell_id) {
+                        continue;
+                    }
+                    let owner = context.owner;
                     // For new repositories, trust is anchored in the explicitly pinned owner's peer profile.
-                    if s.cell(&snapshot.context()?.cell_id).is_err()
-                        && owner != peer.profile.identity
-                    {
+                    if s.cell(&context.cell_id).is_err() && owner != peer.profile.identity {
                         bail!("new CELL must originate from its pinned owner");
                     }
                     s.import_snapshot(&snapshot, &owner, None)?;
@@ -209,6 +254,8 @@ async fn process(app: &App, peer: Peer, request: PeerRequest) -> Result<PeerResp
         }
     }
 }
+/// Encrypt ordered transport-sized chunks, advancing send nonces.
+/// Rejects plaintext above 48 MiB; an empty input produces no chunks.
 fn encode(session: &mut SecureSession, plain: &[u8]) -> Result<Vec<String>> {
     if plain.len() > MAX_EXCHANGE {
         bail!("peer exchange exceeds prototype limit");
@@ -218,6 +265,9 @@ fn encode(session: &mut SecureSession, plain: &[u8]) -> Result<Vec<String>> {
         .map(|chunk| Ok(STANDARD.encode(session.encrypt(chunk)?)))
         .collect()
 }
+/// Authenticate ordered chunks into a zeroizing buffer, advancing receive nonces.
+/// Rejects empty/oversized exchanges, invalid base64, and Noise/replay failures;
+/// a failed decode does not roll back transport state.
 fn decode(session: &mut SecureSession, chunks: &[String]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     if chunks.is_empty() || chunks.len() > MAX_EXCHANGE / MAX_PLAINTEXT + 1 {
         bail!("invalid encrypted chunk count");
@@ -236,6 +286,11 @@ fn decode(session: &mut SecureSession, chunks: &[String]) -> Result<zeroize::Zer
 }
 
 /// Both endpoint static keys are pinned before exchanging any repository bytes.
+///
+/// Performs a fresh HTTP handshake and one exchange; no retries or import occur
+/// here. Rejects a pin/profile mismatch, network/status/codec errors, and remote
+/// `Failure` replies. Callers must supply a previously verified peer profile and
+/// enforce local lifecycle policy before invoking this low-level client.
 pub async fn exchange(app: &App, peer: &Peer, request: PeerRequest) -> Result<PeerResponse> {
     let pin: [u8; 32] = hex::decode(&peer.public_key)?
         .try_into()
@@ -283,6 +338,11 @@ pub async fn exchange(app: &App, peer: &Peer, request: PeerRequest) -> Result<Pe
     Ok(response)
 }
 
+/// Pull authorized snapshots from a configured peer, import, then push local ones.
+///
+/// Requires an active local FRAME. Unknown CELL owners must match the pinned
+/// peer; deleted CELLs are skipped. Store, validation, or transport errors abort
+/// the sequence without undoing earlier imports or remote effects.
 pub async fn sync(app: &App, id: &str) -> Result<SyncReport> {
     let id = id.to_owned();
     let peer = app
@@ -293,19 +353,24 @@ pub async fn sync(app: &App, id: &str) -> Result<SyncReport> {
         .await?;
     let mut received = 0;
     if let PeerResponse::Snapshots { snapshots } = exchange(app, &peer, PeerRequest::Pull).await? {
-        received = snapshots.len();
         let owner_peer = peer.profile.identity.clone();
-        app.execute(move |s| {
-            for snapshot in snapshots {
-                let context = snapshot.context()?;
-                if s.cell(&context.cell_id).is_err() && context.owner != owner_peer {
-                    bail!("new CELL owner is not the pinned peer");
+        received = app
+            .execute(move |s| {
+                let mut received = 0;
+                for snapshot in snapshots {
+                    let context = snapshot.context()?;
+                    if s.is_cell_deleted(&context.cell_id) {
+                        continue;
+                    }
+                    if s.cell(&context.cell_id).is_err() && context.owner != owner_peer {
+                        bail!("new CELL owner is not the pinned peer");
+                    }
+                    s.import_snapshot(&snapshot, &context.owner, None)?;
+                    received += 1;
                 }
-                s.import_snapshot(&snapshot, &context.owner, None)?;
-            }
-            Ok(())
-        })
-        .await?;
+                Ok(received)
+            })
+            .await?;
     }
     let cert = peer.profile.certificate.clone();
     let snapshots = app.execute(move |s| s.snapshots_for(&cert)).await?;
@@ -314,6 +379,11 @@ pub async fn sync(app: &App, id: &str) -> Result<SyncReport> {
     Ok(SyncReport { received, sent })
 }
 
+/// Revoke a same-identity peer in local CELLs, then send its signed lock notice.
+///
+/// Requires an active local FRAME and configured peer. Local revocations are
+/// persisted before network delivery: a failed exchange does not undo them and
+/// does not prove that the remote FRAME locked itself.
 pub async fn revoke_frame(app: &App, id: &str) -> Result<()> {
     let id = id.to_owned();
     let (peer, notice) = app

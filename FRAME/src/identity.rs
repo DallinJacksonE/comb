@@ -28,6 +28,12 @@ pub struct Profile {
     pub noise_public: [u8; 32],
     pub nonce: String,
     pub signature: Signature,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_signature: Option<Signature>,
 }
 impl Profile {
     pub fn id(&self) -> String {
@@ -123,7 +129,89 @@ pub fn validate_profile(profile: &Profile, expected_identity: &IdentityPublic) -
     profile
         .signature
         .verify(&signing_key, PROFILE_DOMAIN, &signed_bytes(profile)?)?;
+    match (
+        &profile.username,
+        &profile.ssh_public_key,
+        &profile.ssh_signature,
+    ) {
+        (None, None, None) => {}
+        (Some(username), Some(public_key), Some(signature)) => {
+            validate_ssh_username(username)?;
+            validate_ssh_public_key(public_key)?;
+            signature.verify(
+                &profile.certificate.frame.signing_key,
+                SSH_PROFILE_DOMAIN,
+                &ssh_signed_bytes(profile)?,
+            )?;
+        }
+        _ => anyhow::bail!("incomplete SSH profile extension"),
+    }
     Ok(())
+}
+const SSH_PROFILE_DOMAIN: &[u8] = b"COMB-FRAME-profile-ssh-v1";
+fn ssh_signed_bytes(profile: &Profile) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&(
+        1_u32,
+        signed_bytes(profile)?,
+        &profile.signature,
+        &profile.username,
+        &profile.ssh_public_key,
+    ))?)
+}
+pub fn validate_ssh_username(username: &str) -> Result<()> {
+    ensure!(
+        !username.is_empty()
+            && username.len() <= 32
+            && username.as_bytes()[0].is_ascii_lowercase()
+            && username
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'),
+        "invalid SSH username"
+    );
+    Ok(())
+}
+pub fn validate_ssh_public_key(public_key: &str) -> Result<()> {
+    let key = russh::keys::PublicKey::from_openssh(public_key)?;
+    ensure!(
+        key.algorithm() == russh::keys::Algorithm::Ed25519
+            && key.to_openssh()? == public_key
+            && key.comment().is_empty(),
+        "expected canonical Ed25519 public key without comment"
+    );
+    Ok(())
+}
+/// Configure device-authorized SSH metadata without opening recovery authority.
+/// The encrypted vault is authoritative; a failed public write is rolled back.
+pub fn configure_ssh_profile(
+    data: &Path,
+    password: &[u8],
+    username: &str,
+    public_key: &str,
+) -> Result<Profile> {
+    validate_ssh_username(username)?;
+    validate_ssh_public_key(public_key)?;
+    let _lock = lock(data)?;
+    let local = load(data, password)?;
+    let mut profile = local.profile.clone();
+    profile.username = Some(username.into());
+    profile.ssh_public_key = Some(public_key.into());
+    profile.ssh_signature = Some(
+        local
+            .frame
+            .sign(SSH_PROFILE_DOMAIN, &ssh_signed_bytes(&profile)?),
+    );
+    validate_profile(&profile, &profile.identity)?;
+    let mut vault = open_vault(&data.join("node.vault"), password, NODE_CONTEXT)?;
+    vault.profile = Some(profile.clone());
+    let sealed = seal_vault(&vault, password, NODE_CONTEXT)?;
+    let original = fs::read(data.join("node.vault"))?;
+    atomic_write(&data.join("node.vault"), &sealed)?;
+    if let Err(error) = atomic_write(&data.join("profile.json"), &serde_json::to_vec(&profile)?) {
+        atomic_write(&data.join("node.vault"), &original)
+            .context("profile update rollback failed")?;
+        return Err(error);
+    }
+    Ok(profile)
 }
 fn certify(
     root: &IdentitySecrets,
@@ -139,6 +227,9 @@ fn certify(
         noise_public: request.noise_public,
         nonce: request.nonce.clone(),
         signature: Signature { bytes: Vec::new() },
+        username: None,
+        ssh_public_key: None,
+        ssh_signature: None,
     };
     profile.signature = root.sign(PROFILE_DOMAIN, &signed_bytes(&profile)?);
     validate_profile(&profile, &root.public())?;
@@ -220,9 +311,17 @@ fn seal_vault(vault: &NodeVault, password: &[u8], context: &[u8]) -> Result<Vec<
         &plain, password, context,
     )?)?)
 }
+/// A password-sealed vault rejected the supplied secret (or was tampered with).
+#[derive(Debug, thiserror::Error)]
+#[error("Incorrect password")]
+pub struct IncorrectPassword;
+
 fn open_vault(path: &Path, password: &[u8], context: &[u8]) -> Result<NodeVault> {
     let envelope: PasswordEnvelope = read_json(path)?;
-    let plain = open_secret(&envelope, password, context)?;
+    let plain = open_secret(&envelope, password, context).map_err(|error| match error {
+        comb_cell::Error::Authentication => anyhow::Error::new(IncorrectPassword),
+        error => error.into(),
+    })?;
     Ok(serde_json::from_slice(&plain)?)
 }
 struct Lock(PathBuf);
@@ -413,6 +512,9 @@ pub fn authorize_from_frame(
         noise_public: request.noise_public,
         nonce: request.nonce.clone(),
         signature: Signature { bytes: Vec::new() },
+        username: None,
+        ssh_public_key: None,
+        ssh_signature: None,
     };
     profile.signature = local.frame.sign(PROFILE_DOMAIN, &signed_bytes(&profile)?);
     validate_profile(&profile, &local.profile.identity)?;

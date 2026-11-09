@@ -15,6 +15,18 @@ A signed operation-set DAG implements deterministic metadata merging, explicit a
 
 ## Prerequisites and Build
 
+For a Linux/systemd user installation, see [installation and recovery walkthrough](FRAME/INSTALL.md). From the current checkout:
+
+```sh
+bash FRAME/install.sh
+```
+
+This builds and installs the binary and GUI, adds user PATH integration, and starts a locked user service without saving your password. Run `comb` in a new terminal for initial setup/unlock. Subsequent commands reuse the private local session; restarting/rebooting requires unlocking again. Both install and setup explain why the encrypted recovery file **plus its original password** and separate encrypted CELL backups matter. Uninstall removes owned program/service files while preserving all identity/repository/recovery data.
+
+The guide includes curl-based installation once this revision is published; uncommitted code is not assumed to exist on the public URL. The commands below are the alternative manual/source-development workflow, not additional steps after installing the user service.
+
+The local script uses its own source checkout; `--source /path/to/comb` overrides it. It validates uninstall support before building and installs a standalone cleanup script. Default installations can also be removed directly from source with `bash FRAME/uninstall.sh`, preserving identity/CELL/recovery data.
+
 Linux/Unix, a recent Rust toolchain supporting edition 2024 and standard file locking, Git, and Node/npm. This implementation uses Unix file permissions. Run from the project root:
 
 ```sh
@@ -32,25 +44,29 @@ target/debug/comb user
 target/debug/comb serve
 ```
 
-Setup asks for a local password, name, and email and generates identity, FRAME, recipient, and Noise transport keys. The default state directory is `$XDG_DATA_HOME/comb`, or `$HOME/.local/share/comb`. Override it with `--data /absolute/path` for separate test devices.
+Setup asks for a local FRAME password, name, email, SSH username, and optional SSH-key passphrase, and generates identity, FRAME, recipient, Noise transport, and separate OpenSSH client/server keys. The default state directory is `$XDG_DATA_HOME/comb`, or `$HOME/.local/share/comb`. Override it with `--data /absolute/path` for separate test devices.
 
 The default endpoints are:
 
 - Management API, Git, GUI: `http://127.0.0.1:7331`
 - Authenticated encrypted peer carrier: `http://127.0.0.1:7332`
+- Public-key-only SSH Git after setup/unlock: `127.0.0.1:7333`
 
-In another terminal, obtain the local token and open the GUI:
+In another terminal, display the GUI URL:
 
 ```sh
-target/debug/comb token
 target/debug/comb webgui
 ```
 
-Paste the token into the GUI. It is an in-memory management credential, not a global account login. Treat the token as a secret. GUI supports status, CELL creation and inline inspection, issues, and explicit peer registration. Other operations are currently CLI/API based.
+Open that URL in your browser. The GUI automatically connects to the unlocked local FRAME without a token form. If the managed service is locked, first run a management command such as `target/debug/comb cell list`, then reload or choose Retry. Browser API access is same-origin and loopback-only; it is a trusted-local-machine convenience, not OS-user authentication. CLI/Git authentication still uses its existing credentials (`target/debug/comb token` prints the Git/management credential; treat it as a secret). Click a repository to open its Code, Issues, and Settings pages. Code defaults to a file tree and formatted README; Settings exposes membership, FRAME registration, encrypted backup export, rename, and confirmed local deletion. Status, CELL creation, and explicit peer registration remain on the main page.
 
 For testing only, `COMB_PASSWORD` avoids repeated password prompts; `COMB_RECOVERY_PASSWORD` supplies a separate recovery-file password. Interactive prompts are preferable to putting secrets in shell history. Environment variables can be observed by sufficiently privileged processes.
 
-`serve` supports `--listen`, `--peer-listen`, `--assets`, and `--sync-seconds`. Management/Git HTTP refuses non-loopback binding. The peer carrier may bind a reachable address because its repository traffic uses mutually authenticated end-to-end Noise sessions. Run persistent full FRAMEs with the same daemon and durable private state directory; no provider identity authority is required.
+`serve` supports `--managed`, `--listen`, `--peer-listen`, `--ssh-listen`, `--assets`, and `--sync-seconds`. Managed startup waits for private local initialization/unlock instead of prompting in a service journal. Management/Git HTTP refuses non-loopback binding. The peer carrier may bind a reachable address because its repository traffic uses mutually authenticated end-to-end Noise sessions. Run persistent full FRAMEs with the same daemon and durable private state directory; no provider identity authority is required.
+
+## Optional HTTPS WebGUI hosting
+
+Developers can opt into a separate authenticated HTTPS listener for their own FRAME, using either an operator-provisioned PEM certificate/key or an explicitly trusted TLS reverse proxy. See [HTTPS setup, local development certificates, Let's Encrypt/Caddy, managed services, and renewal](FRAME/HTTPS.md). HTTPS is not enabled automatically by installation, and COMB does not issue public certificates itself. Never expose or proxy the default token-free local listener at port 7331; use the separate `--web-listen` endpoint with its configured `--web-origin`. Remote sign-in uses the management token, not the FRAME unlock password, and does not unlock a locked FRAME.
 
 ## Standard Git
 
@@ -60,15 +76,27 @@ Create a CELL in the GUI or with:
 target/debug/comb cell create example
 ```
 
-Use the returned CELL ID in an ordinary Git remote:
+The GUI and CELL summaries expose an SSH remote such as `comb-YOUR_FRAME_ID_PREFIX:example.git`. Use the actual returned alias in an ordinary Git remote: it automatically selects this FRAME's generated client key. OpenSSH asks for its optional passphrase, and an available `ssh-agent` may cache it. Existing installations add SSH with `comb ssh setup --username YOUR_USERNAME`, then restart/unlock the daemon; see [SSH setup, migration and security](FRAME/INSTALL.md#ssh-git-access). SSH is local-only by default, supports an explicit network bind, and enforces the authenticated FRAME's current CELL permissions. It provides Git transport, not shell access.
+
+HTTP remotes remain supported. Use the returned URL slug (the example's slug is `example`):
 
 ```sh
-git remote add origin http://127.0.0.1:7331/git/CELL_ID.git
+git remote add origin http://127.0.0.1:7331/git/example.git
 git push origin main
-git clone http://127.0.0.1:7331/git/CELL_ID.git
+git clone http://127.0.0.1:7331/git/example.git
 ```
 
 For this local prototype, authenticate Git with any nonempty username and the local FRAME management token as its password, preferably using a Git credential helper. Bearer authentication also works. Do not embed the token into a shared repository URL. There are no `comb push`, `comb pull`, or other Git wrappers.
+
+### Repository pages and naming
+
+Names map to lowercase ASCII URL slugs: `My Repo` becomes `/git/my-repo.git`. Create/rename reject empty, conflicting, and reserved ID-shaped slugs. Existing `/git/CELL_ID.git` remotes continue working. If old/imported repositories have ambiguous slugs, name lookup fails closed; use their immutable IDs. The GUI pages also use immutable IDs (`/cells/CELL_ID`, `/issues`, `/settings`), so bookmarks survive renaming.
+
+Owner-authorized signed rename events preserve the CELL's genesis identity/history and replicate the effective name. The displayed slug changes with the name; update name-based Git remotes after renaming, or use the ID remote for stable addressing. Older binaries cannot parse the new signed Rename operation; update collaborating FRAME binaries before using rename.
+
+Code browsing exposes only committed objects reachable from accepted branches/tags, with branch/directory/file navigation. README Markdown disables raw HTML, unsafe URL protocols, and embedded images. Binary files, symlinks, and submodules are not previewed; text previews are limited to 1 MiB and directory listings to 2000 entries / 1 MiB of Git output. Empty repositories show push instructions. This is read-only code browsing, not a browser editor.
+
+Deletion requires an active owner FRAME and typing the exact current name. It removes that CELL's local runtime repository and private historical snapshots, persisting an encrypted tombstone so peer sync cannot silently restore it. Unrelated repositories continue syncing. It does not delete other devices' copies, independent working trees, exported backups, or promise secure physical erasure. There is no undo/reimport toggle for that tombstone in this UI; retain an exported backup and use a separate authorized/recovered FRAME if you need the deleted repository again.
 
 Concurrent same-branch tips are advertised under `refs/comb/divergent/...`; no arbitrary winner is selected. Fetch those refs explicitly and integrate using Git:
 
@@ -79,6 +107,8 @@ git push origin HEAD:refs/heads/main
 ```
 
 A divergent branch may temporarily have no single `main` ref, so cloning without selecting a retained ref will not check out a default branch until integration resolves it.
+
+Snapshots preserve notes and custom ref namespaces as well as branches/tags, whether refs are loose or packed. The `refs/comb/` namespace is FRAME-managed: client pushes to it are rejected, while retained divergence refs remain fetchable.
 
 ## Enroll Another Device Without Copying Its FRAME Key
 
@@ -172,6 +202,10 @@ This creates fresh FRAME/Noise keys, recovers the identity's historical unwrappi
 
 ## Tests and Quality Gates
 
+Use `make test` for the Rust workspace, GUI tests, and isolated installer contracts. Each phase has a GNU `timeout` watchdog (180 seconds, then forced termination after 5 more seconds). Override it explicitly on slower hosts with `make TEST_TIMEOUT=300s test`. Direct `cargo test` does not use this watchdog.
+
+Development/test builds optimize the Argon2 and Blake2 dependency hot loops. This avoids spending minutes in unoptimized password derivation across identity/recovery fixtures without reducing the actual KDF's memory/pass parameters, substituting test crypto, or skipping coverage. The first run after a profile change rebuilds affected crates. The installer suite also deliberately exercises bounded readiness-failure paths, so it takes longer than the GUI unit tests.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -182,6 +216,10 @@ python scripts/integration_smoke.py
 ```
 
 The smoke test creates isolated temporary identities, runs real daemons, pushes/clones through Git HTTP, synchronizes over pinned Noise, preserves and explicitly merges divergent histories, revokes contributor/FRAME access, checks listener closure and restore, deletes original FRAME data, and restores clonable code from ciphertext plus offline recovery material. It stops all child processes in `finally`.
+
+`FRAME/tests/ref_round_trip.rs` additionally exercises ordinary Git HTTP push, encrypted Store shutdown/reopen, and fresh-client fetch of notes, annotated tags, and custom refs; it checks loose/packed custom-ref archive parity and rejects client writes to FRAME-managed refs.
+
+Snapshot import and encrypted Store reopening run Git's full strict object-integrity check, with replacement objects disabled, before exposing the repository. Matching signed refs alone is insufficient: missing descendants, invalid object contents/hashes, and corrupt packs are rejected. `FRAME/tests/snapshot_integrity.rs` covers these cases, unchanged accepted state after rejected imports, and healthy packed snapshots. This validation does not replace crash-atomic persistence or establish backup freshness/completeness beyond the supplied Git object graph.
 
 GUARD tests include wrong-pin/MITM, tamper/replay, STUN packet validation, safe coturn config, and backup integrity. Real coturn validation is opt-in:
 
@@ -200,7 +238,7 @@ This is an unaudited development implementation, not a military/enterprise assur
 - Policy propagation is eventual. Stale peers may disclose keys or accept work before learning a revocation. The data-adoption flow cannot retract a previously disclosed key.
 - Signed history is validated, but secure monotonic rollback prevention, backup completeness proofs, identity/root rotation, and crash-atomic restore across all files are not complete.
 - `comb clean` is preview-only. Destructive Git dependency-aware cleanup is deliberately disabled rather than approximated with a hard reset. Metadata adoption/exclusion exists in CELL, but Git history cleanup requires more work.
-- The GUI does not yet provide code browsing, milestone editing, workflow configuration, or full reconciliation UX. Issues support create/list. No workflow executor is enabled.
+- The GUI does not yet provide browser code editing, milestone editing, workflow configuration, or full reconciliation UX. Issues support create/list. No workflow executor is enabled.
 - Full ICE candidate exchange/nomination, TURN client relay transport, global user discovery, hosted storage APIs, remote-host installation, transfer ZIP commands, service updater/restart integration, and the general `new-key` command remain unimplemented. Their design requirements are retained in `system/readme.md`.
 - The implementation transfers whole bounded snapshots rather than streaming large Git packs. Current limits are 32 MiB for repository archives and 48 MiB for a serialized peer exchange; JSON byte-array encoding adds overhead.
 - Read-only members can re-encrypt/replicate already validated state and recover/reopen backups without gaining code-write authority: every code/policy operation inside the signed DAG is independently authorized. A snapshot carrier signature is not permission to invent a code update.

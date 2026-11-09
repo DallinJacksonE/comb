@@ -18,3 +18,12 @@ rand = "0.8"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 tempfile = "3"
+
+# Keep the real password KDF parameters without unoptimized hot loops in
+# development builds. Test profiles inherit these dev overrides;
+# subprocess-based CLI tests and ordinary development runs benefit as well.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

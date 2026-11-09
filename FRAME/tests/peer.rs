@@ -69,6 +69,25 @@ async fn pinned_frames_replicate_encrypted_snapshots_and_reject_wrong_pins() {
             .await
             .is_err()
     );
+    // Removing one local repository must not block replication of unrelated cells.
+    let deleted = cell.id.clone();
+    aa.execute(move |store| store.delete_cell(&deleted, "ENCRYPTED PEER REPOSITORY"))
+        .await
+        .unwrap();
+    ab.execute(move |store| {
+        let cell = store.create_cell("Bob Retained Repo".into())?;
+        store.grant(&cell.id, &pa, Role::Write)
+    })
+    .await
+    .unwrap();
+    let report = sync(&aa, &pb.frame_id()).await.unwrap();
+    assert_eq!(report.received, 1);
+    let remaining = aa.execute(|store| store.list_cells()).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name, "Bob Retained Repo");
+    assert_eq!(ab.execute(|store| Ok(store.count())).await.unwrap(), 2);
+    sync(&ab, &peer_a.id).await.unwrap();
+    assert_eq!(aa.execute(|store| Ok(store.count())).await.unwrap(), 1);
     ta.abort();
     tb.abort();
 }

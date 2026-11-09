@@ -12,6 +12,12 @@ Unapproved recommendations, protocol alternatives, and remaining design question
 
 The current executable prototype, run instructions, verified behavior, and explicit implementation gaps are documented separately in [the implementation README](../README.md).
 
+### Version 1 release scope
+
+Version 1 targets a dependable core Git remote with collaboration, NAT traversal through STUN/TURN, and opt-in public discovery. Connectivity/discovery infrastructure includes an additional service under `GUARD/`. The broader platform requirements below remain the long-term target rather than implying every feature must ship in v1.
+
+V1 includes a simple issue board stored in CELL data, replicated with that CELL, and visible in the GUI. Public repositories hosted by public FRAMEs allow public issue submission when public issue writing is enabled through the GUI. The public-issue identity/authentication, moderation, and exposure contracts still need definition; public issue submission does not imply code-write or management permission.
+
 ## 1. Architecture and Boundaries
 
 | Component | Responsibility |
@@ -114,6 +120,8 @@ Identity keys and FRAME keys are separate even though both are held within FRAME
 3. FRAME creates the user's identity recovery file and explains its custody and loss consequences.
 
 Names and email addresses are identity metadata, not substitutes for cryptographic authorization.
+
+The Linux user installer builds COMB and its GUI, integrates the user's PATH, and starts a locked user-level FRAME service. The first interactive management command guides initialization and unlock. A restart/reboot requires a new unlock; the service must not persist the password to bypass this. Installation and initialization explain recovery-file custody: retain the encrypted file and its original password, verify an offline copy, and keep separate encrypted CELL backups. Uninstall removes owned program/service integration while preserving identities, CELL state, working copies and recovery material.
 
 ### Additional devices
 

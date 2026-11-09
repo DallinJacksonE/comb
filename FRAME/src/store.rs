@@ -14,13 +14,16 @@ use comb_cell::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
 
 const CONTROL_AAD: &[u8] = b"comb.frame.control.v1";
+mod browse;
+mod naming;
 mod restore;
+mod ssh;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Peer {
@@ -34,6 +37,8 @@ pub struct Peer {
 #[serde(deny_unknown_fields)]
 struct Control {
     current: BTreeMap<String, String>,
+    #[serde(default)]
+    tombstones: BTreeSet<String>,
     pins: BTreeMap<String, IdentityPublic>,
     peers: BTreeMap<String, Peer>,
     lifecycle: Lifecycle,
@@ -50,15 +55,19 @@ struct CellPayload {
 pub struct CellSummary {
     pub id: String,
     pub name: String,
+    pub slug: String,
     pub owner: String,
     pub version: String,
     pub refs: BTreeMap<String, String>,
     pub members: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_remote: Option<String>,
 }
 
 /// Only encrypted snapshots/control survive shutdown; Git storage is a private runtime cache.
 pub struct Store {
     pub local: LocalIdentity,
+    pub(crate) ssh_identity: Option<crate::ssh_keys::ServerIdentity>,
     _directory_lock: std::fs::File,
     data: PathBuf,
     runtime: tempfile::TempDir,
@@ -85,6 +94,7 @@ impl Store {
             .try_lock()
             .context("another FRAME already owns this data directory")?;
         let local = identity::load(data, password)?;
+        let ssh_identity = crate::ssh_keys::load_server(data, password)?;
         let control_path = data.join("control.enc");
         let control = if control_path.exists() {
             let encrypted: EncryptedSnapshot =
@@ -101,6 +111,7 @@ impl Store {
         identity::private_directory(&data.join("snapshots"))?;
         let mut store = Self {
             local,
+            ssh_identity,
             _directory_lock: directory_lock,
             data: data.to_owned(),
             runtime,
@@ -109,6 +120,10 @@ impl Store {
         };
         let entries = store.control.current.clone();
         for (id, digest) in entries {
+            if store.control.tombstones.contains(&id) {
+                store.control.current.remove(&id);
+                continue;
+            }
             let snapshot = store.read_snapshot(&digest)?;
             let owner = store
                 .control
@@ -170,23 +185,29 @@ impl Store {
         self.save_control()
     }
     pub fn list_cells(&self) -> Result<Vec<CellSummary>> {
-        Ok(self.cells.values().map(summary).collect())
+        Ok(self
+            .cells
+            .values()
+            .map(|cell| self.cell_summary_value(cell))
+            .collect())
     }
     pub fn cell(&self, id: &str) -> Result<&Cell> {
         self.cells.get(id).context("unknown CELL")
     }
     pub fn cell_summary(&self, id: &str) -> Result<CellSummary> {
-        Ok(summary(self.cell(id)?))
+        Ok(self.cell_summary_value(self.cell(id)?))
+    }
+    fn cell_summary_value(&self, cell: &Cell) -> CellSummary {
+        let mut value = summary(cell);
+        value.ssh_remote = self
+            .ssh_identity
+            .as_ref()
+            .map(|identity| format!("{}:{}.git", identity.settings.alias, value.slug));
+        value
     }
     pub fn create_cell(&mut self, name: String) -> Result<CellSummary> {
         self.ensure_active()?;
-        let name = name.trim().to_owned();
-        if name.is_empty() || name.len() > 120 || name.chars().any(char::is_control) {
-            bail!("CELL name must contain 1..120 printable bytes");
-        }
-        if self.cells.values().any(|c| c.name == name) {
-            bail!("CELL name already exists");
-        }
+        let name = self.validate_cell_name(&name, None)?;
         let cell = Cell::create(name, &self.local.frame, &self.local.profile.certificate)?;
         GitRepository::create(self.runtime.path(), &cell.id)?;
         let id = cell.id.clone();
@@ -197,6 +218,10 @@ impl Store {
     }
     pub fn operate(&mut self, id: &str, operation: Operation) -> Result<CellSummary> {
         self.ensure_active()?;
+        if let Operation::Rename { name } = &operation {
+            self.ensure_cell_owner(id)?;
+            self.validate_cell_name(name, Some(id))?;
+        }
         self.cells.get_mut(id).context("unknown CELL")?.apply(
             operation,
             &self.local.frame,
@@ -254,6 +279,8 @@ impl Store {
         body: &[u8],
     ) -> Result<crate::git::GitResponse> {
         self.ensure_active()?;
+        let resolved = self.resolve_git_cell(id)?;
+        let id = resolved.as_str();
         let write = suffix == "git-receive-pack" || query.contains("git-receive-pack");
         if !self
             .cell(id)?
@@ -300,6 +327,9 @@ impl Store {
         self.ensure_active()?;
         let context = snapshot.context()?;
         crate::git::validate_id(&context.cell_id)?;
+        if self.control.tombstones.contains(&context.cell_id) {
+            bail!("CELL was deleted locally; automatic reimport is blocked");
+        }
         let owner = self
             .control
             .pins
@@ -341,6 +371,7 @@ impl Store {
         if incoming.refs()? != payload.cell.refs() {
             bail!("archive refs differ from signed CELL metadata");
         }
+        incoming.validate_objects()?;
         let mut candidate = if let Some(current) = self.cells.get(&context.cell_id) {
             let mut candidate = current.clone();
             candidate.merge(&payload.cell)?;
@@ -432,6 +463,7 @@ impl Store {
         if repo.refs()? != payload.cell.refs() {
             bail!("Git snapshot refs do not match the complete accepted projection");
         }
+        repo.validate_objects()?;
         repo.install_refs(&payload.cell.refs())?;
         Ok(())
     }
@@ -529,8 +561,10 @@ impl Store {
 }
 fn summary(cell: &Cell) -> CellSummary {
     CellSummary {
+        ssh_remote: None,
         id: cell.id.clone(),
-        name: cell.name.clone(),
+        name: cell.effective_name(),
+        slug: naming::slug(&cell.effective_name()),
         owner: identity_id(&cell.owner),
         version: cell.version_id(),
         refs: cell.refs(),

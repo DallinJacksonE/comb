@@ -1,0 +1,14 @@
+# Dedicated Caddy instance: do not combine with wildcard/load certificates from
+# other sites. Explicit single issuer means no fallback to eMudhra or another CA.
+{$COMB_WEB_HOST} {
+    tls {
+        issuer acme {
+            dir https://acme-v02.api.letsencrypt.org/directory
+            email {$COMB_ACME_EMAIL}
+        }
+    }
+    reverse_proxy 127.0.0.1:7443 {
+        # FRAME validates this against --web-origin; never rewrite to localhost.
+        header_up Host {http.request.host}
+    }
+}

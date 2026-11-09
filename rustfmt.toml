@@ -1,0 +1,2 @@
+# Match workspace.package.edition for rustfmt invoked outside Cargo as well.
+edition = "2024"

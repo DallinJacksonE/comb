@@ -3,6 +3,10 @@
 Reusable Rust crypto primitives for COMB. **Unaudited prototype; no production-security claim.**
 Package `comb-cell`, crate `comb_cell`. Public items are re-exported at crate root.
 
+See [ENCRYPTION.md](ENCRYPTION.md) for the encryption algorithms, authenticated
+formats, password protection, recovery, and security boundaries;
+[DOMAIN.md](DOMAIN.md) describes the signed metadata layer.
+
 ## Roles and enrollment
 
 `IdentitySecrets` owns two independently random secrets: Ed25519 identity signing

@@ -1,3 +1,5 @@
+//! Password-based sealing for arbitrary secrets and identity/device bundles.
+//! Versioned fixed KDF costs prevent an envelope from choosing resource parameters.
 use crate::{Error, FrameSecrets, IdentitySecrets, Result, message, random};
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
@@ -12,11 +14,16 @@ use zeroize::Zeroizing;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PasswordEnvelope {
+    /// Wire-format version selecting the fixed cipher and KDF suite.
     pub version: u32,
+    /// Random 16-byte Argon2id salt.
     pub salt: [u8; 16],
+    /// Random 24-byte XChaCha20Poly1305 nonce.
     pub nonce: [u8; 24],
+    /// Encrypted secret bytes including the AEAD authentication tag.
     pub ciphertext: Vec<u8>,
 }
+/// Derive a zeroizing 256-bit key using the fixed version 1 Argon2id parameters.
 fn key(password: &[u8], salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
     let params = Params::new(65536, 3, 1, Some(32)).map_err(|_| Error::Format)?;
     let mut key = Zeroizing::new([0; 32]);
@@ -25,6 +32,7 @@ fn key(password: &[u8], salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
         .map_err(|_| Error::Authentication)?;
     Ok(key)
 }
+/// Authenticate version, salt, nonce, and caller-selected purpose context.
 fn aad(envelope: &PasswordEnvelope, context: &[u8]) -> Vec<u8> {
     message(
         b"password-envelope",
@@ -56,6 +64,9 @@ pub fn seal_secret(plaintext: &[u8], password: &[u8], context: &[u8]) -> Result<
         .map_err(|_| Error::Authentication)?;
     Ok(envelope)
 }
+/// Decrypt with the exact original password and purpose context.
+/// Wrong passwords, context mismatches, and tampering share `Error::Authentication`.
+/// Rejects unsupported versions before allocating Argon2 working memory.
 pub fn open_secret(
     envelope: &PasswordEnvelope,
     password: &[u8],
@@ -77,12 +88,16 @@ pub fn open_secret(
     Ok(Zeroizing::new(plaintext))
 }
 impl IdentitySecrets {
+    /// Seal root signing seed followed by recovery secret as exactly 64 bytes.
+    /// Uses the `identity-recovery-v1` context; keep the result and its password protected.
     pub fn export_encrypted(&self, password: &[u8]) -> Result<PasswordEnvelope> {
         let mut bytes = Zeroizing::new([0; 64]);
         bytes[..32].copy_from_slice(&self.signing);
         bytes[32..].copy_from_slice(&self.recovery);
         seal_secret(&*bytes, password, b"identity-recovery-v1")
     }
+    /// Restore the same identity from an authenticated 64-byte recovery bundle.
+    /// Does not enroll a device or validate an external identity pin.
     pub fn import_encrypted(envelope: &PasswordEnvelope, password: &[u8]) -> Result<Self> {
         let bytes = open_secret(envelope, password, b"identity-recovery-v1")?;
         if bytes.len() != 64 {
@@ -102,6 +117,8 @@ impl FrameSecrets {
         bytes[32..].copy_from_slice(&self.encryption);
         seal_secret(&*bytes, password, b"frame-local-v1")
     }
+    /// Restore the same FRAME from a 64-byte bundle under `frame-local-v1`.
+    /// For a new device, generate fresh keys and enroll it instead.
     pub fn import_encrypted(envelope: &PasswordEnvelope, password: &[u8]) -> Result<Self> {
         let bytes = open_secret(envelope, password, b"frame-local-v1")?;
         if bytes.len() != 64 {

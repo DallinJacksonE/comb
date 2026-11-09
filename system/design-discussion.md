@@ -276,6 +276,12 @@ Also decide what infrastructure operators can observe: endpoint addresses, traff
 
 ## 7. Treat Workflows as Untrusted Execution
 
+### Confirmed v1 collaboration and public issues
+
+V1 is the dependable core, including NAT traversal, opt-in public discovery, collaboration, and a simple GUI issue board whose state belongs to the CELL. An additional connectivity/discovery service belongs under `GUARD/`. Public repositories on public FRAMEs support public issue submission when enabled through GUI settings.
+
+Before implementing public issues, resolve whether submitters are anonymous or authenticated COMB identities; distinguish listing/reading from creating, commenting, editing and closing issues; define who can change the setting and moderate submissions. Specify public repository/FRAME publication and exposure separately from the private local management listener. Choose admission limits and spam controls without giving discovery or issue submission authority over code or CELL membership. None of these mechanisms is selected by approving the feature.
+
 **Recommendation:** Replicating a workflow definition must not automatically authorize it to run on another collaborator's machine.
 
 Define:

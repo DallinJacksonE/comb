@@ -1,5 +1,14 @@
-//! Standard Git repository operations. Never invokes a shell or accepts arbitrary paths.
+//! Standard Git operations on repositories under a caller-trusted runtime root.
+//!
+//! Commands use argument vectors, never a shell. This layer validates identifiers
+//! and Git data, not CELL permissions: HTTP/SSH/store callers must authorize access
+//! before invoking it. The runtime root and process environment are trusted;
+//! these helpers are not a sandbox for arbitrary filesystem roots.
 use anyhow::{Context, Result, bail};
+mod browse;
+pub use browse::{
+    RepositoryBlob, RepositoryCommit, RepositoryEntry, RepositoryHistory, RepositoryTree,
+};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -8,19 +17,27 @@ use std::{
 
 /// Parsed Git CGI response, kept independent of the HTTP framework.
 pub struct GitResponse {
+    /// CGI status code, defaulting to 200 when Git omits `Status`.
     pub status: u16,
+    /// Backend headers other than `Status`, in emitted order.
     pub headers: Vec<(String, String)>,
+    /// Unmodified binary Git response body.
     pub body: Vec<u8>,
 }
 
 /// A trusted, runtime-materialized bare repository owned by FRAME.
 #[derive(Clone)]
 pub struct GitRepository {
+    /// Materialized bare repository; callers own its lifetime and synchronization.
     path: PathBuf,
 }
 
 impl GitRepository {
     /// Initialize a remote with ordinary Git object/ref storage.
+    ///
+    /// Creates the root and runs `git init`, then configures receive integrity,
+    /// no-deletion/non-fast-forward policy and hidden managed refs. Existing paths
+    /// are refused; I/O/Git failures can leave a partially configured repository.
     pub fn create(root: &Path, id: &str) -> Result<Self> {
         validate_id(id)?;
         std::fs::create_dir_all(root)?;
@@ -39,10 +56,16 @@ impl GitRepository {
         repo.run(&["config", "receive.denyDeletes", "true"])?;
         repo.run(&["config", "receive.fsckObjects", "true"])?;
         repo.run(&["config", "transfer.fsckObjects", "true"])?;
+        repo.run(&["config", "receive.hideRefs", "refs/comb/"])?;
         Ok(repo)
     }
 
     /// Open an existing repository only under the caller's trusted runtime root.
+    ///
+    /// This is mutating: resets HEAD to `main`, restores empty object/ref directories,
+    /// and reapplies local receive policy with hooks disabled. Rejects selected
+    /// external-pointer files and symlinks, but does not recursively sandbox the
+    /// root or validate every object; use `validate_objects` for integrity checks.
     pub fn open(root: &Path, id: &str) -> Result<Self> {
         validate_id(id)?;
         let path = root.join(format!("{id}.git"));
@@ -82,15 +105,18 @@ impl GitRepository {
         repo.run(&["config", "receive.fsckObjects", "true"])?;
         repo.run(&["config", "fetch.fsckObjects", "true"])?;
         repo.run(&["config", "core.hooksPath", "/dev/null"])?;
+        repo.run(&["config", "receive.hideRefs", "refs/comb/"])?;
         Ok(repo)
     }
 
     /// Runtime location for Git's own transport and snapshot adapter.
+    /// The returned path conveys no independent authorization or lifetime lease.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Read all branch/tag refs, preserving full ref names.
+    /// Read all refs, including notes, custom namespaces, and retained divergence.
+    /// Returns Git/UTF-8/parse errors; does not filter refs for an external audience.
     pub fn refs(&self) -> Result<BTreeMap<String, String>> {
         let output = self.run(&["for-each-ref", "--format=%(refname) %(objectname)"])?;
         String::from_utf8(output)?
@@ -102,7 +128,28 @@ impl GitRepository {
             .collect()
     }
 
+    /// Check object hashes, structure, and graph connectivity, not merely ref tips.
+    /// Include retained/unreachable objects; never trust replacement refs as repairs.
+    pub(crate) fn validate_objects(&self) -> Result<()> {
+        self.run(&[
+            "--no-replace-objects",
+            "fsck",
+            "--full",
+            "--strict",
+            "--no-reflogs",
+            "--no-dangling",
+        ])
+        .context("Git repository object integrity check failed")?;
+        Ok(())
+    }
+
     /// Fetch validated snapshot objects; preserve divergent commits under stable conflict refs.
+    ///
+    /// Unpacks into a temporary repository and fetches into managed transfer refs.
+    /// New branch/tag tips are installed, fast-forwards advance, and other tips
+    /// are retained under `refs/comb/conflicts/<hash>`. Callers must validate and
+    /// authorize the snapshot separately; `namespace` is validated but is not used
+    /// to name conflict refs. Failures may leave objects or partially updated refs.
     pub fn merge_archive(&self, bytes: &[u8], namespace: &str) -> Result<()> {
         validate_id(namespace)?;
         let temp = tempfile::Builder::new().prefix("comb-import-").tempdir()?;
@@ -163,6 +210,10 @@ impl GitRepository {
     }
 
     /// Set advertised refs to validated accepted metadata, not raw incoming archive refs.
+    ///
+    /// Checks names, hash syntax, and object existence before deleting absent refs
+    /// and installing supplied ones. Does not verify signatures or CELL policy;
+    /// updates are sequential and a Git failure may leave a partial ref set.
     pub fn install_refs(&self, refs: &BTreeMap<String, String>) -> Result<()> {
         for (name, hash) in refs {
             if !name.starts_with("refs/")
@@ -184,6 +235,12 @@ impl GitRepository {
     }
 
     /// Serve only Git's smart HTTP endpoints through the canonical Git backend.
+    ///
+    /// Accepts GET `info/refs` and POST pack endpoints, passing query/content type
+    /// and binary body to `git http-backend`. The caller must authorize reads or
+    /// writes first and persist/sign successful mutations afterward. `REMOTE_USER`
+    /// is a fixed backend marker, not client authentication. Buffers the full
+    /// request/reply; process, pipe, UTF-8 header, and malformed CGI errors propagate.
     pub fn http(
         &self,
         method: &str,
@@ -261,6 +318,8 @@ impl GitRepository {
     }
 
     /// Execute a fixed Git argument vector against this repository.
+    /// Returns stdout or an execution/nonzero-exit error containing stderr.
+    /// Internal callers must constrain arguments; this is not a user command API.
     pub(crate) fn run(&self, args: &[&str]) -> Result<Vec<u8>> {
         checked(
             Command::new("git")
@@ -271,6 +330,8 @@ impl GitRepository {
     }
 }
 
+/// Accept 1–80 ASCII alphanumeric/hyphen bytes for a single repository basename.
+/// Rejects separators and traversal; does not establish that a CELL exists.
 pub(crate) fn validate_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 80 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     {
@@ -279,6 +340,8 @@ pub(crate) fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run a prepared command, buffering stdout/stderr and rejecting nonzero status.
+/// Inherits the configured/default environment; imposes no output or time limit.
 fn checked(command: &mut Command) -> Result<Vec<u8>> {
     let output = command.output().context("execute Git")?;
     if !output.status.success() {

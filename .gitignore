@@ -1,6 +1,8 @@
 /target/
 /FRAME/webgui/node_modules/
 /FRAME/webgui/dist/
+/test_crap/
+__pycache__/
 /.hermes/
 *.vault
 *.recovery

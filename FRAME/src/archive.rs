@@ -1,13 +1,22 @@
-//! Bounded repository snapshots. Incoming peer archives cannot install executable Git config/hooks.
+//! Bounded, allowlisted tar transport for bare Git storage.
+//!
+//! Archives carry objects and refs, never Git configuration or hooks. This is a
+//! filesystem boundary, not proof of object integrity or signed-ref consistency:
+//! callers must also validate the extracted repository against accepted CELL data.
 use anyhow::{Result, bail};
 use std::{
     io::Cursor,
     path::{Component, Path},
 };
 
+/// Maximum encoded tar size and maximum sum of declared extracted file sizes.
 pub const MAX_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Archive Git storage, excluding local executable hooks and host-specific configuration.
+///
+/// Reads `root` without modifying it. Non-regular entries encountered while
+/// walking allowed directories, I/O errors, and oversized output are errors.
+/// The output-size check occurs after building the archive in memory.
 pub fn pack_directory(root: &Path) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
     append_files(&mut builder, root, root)?;
@@ -18,6 +27,8 @@ pub fn pack_directory(root: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Walk objects/refs beneath `root`, appending only allowlisted regular files.
+/// Symlinks and other special entries encountered by the walk are rejected.
 fn append_files(builder: &mut tar::Builder<Vec<u8>>, root: &Path, dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -39,6 +50,8 @@ fn append_files(builder: &mut tar::Builder<Vec<u8>>, root: &Path, dir: &Path) ->
     Ok(())
 }
 
+/// Accept only normal UTF-8 components naming HEAD, packed refs, loose refs,
+/// loose objects, or recognized pack sidecars; never config, hooks, or alternates.
 fn allowed(path: &Path) -> bool {
     let Some(parts) = path
         .components()
@@ -52,9 +65,9 @@ fn allowed(path: &Path) -> bool {
     };
     match parts.as_slice() {
         ["HEAD"] | ["packed-refs"] => true,
-        ["refs", namespace, rest @ ..] if !rest.is_empty() => {
-            matches!(*namespace, "heads" | "tags" | "comb")
-        }
+        // Git accepts notes and custom namespaces as well as heads/tags. Preserve
+        // every loose ref just as packed-refs does, without admitting config/hooks.
+        ["refs", _, rest @ ..] if !rest.is_empty() => true,
         ["objects", directory, name]
             if directory.len() == 2 && directory.bytes().all(|b| b.is_ascii_hexdigit()) =>
         {
@@ -72,7 +85,14 @@ fn allowed(path: &Path) -> bool {
     }
 }
 
-/// Validate the entire archive before extracting into a newly-created trusted directory.
+/// Validate the entire archive before extracting into a caller-controlled directory.
+///
+/// Rejects disallowed paths, links/special files, excessive entry counts, and
+/// encoded or expanded sizes above [`MAX_SNAPSHOT_BYTES`]. The caller must supply
+/// a trusted, preferably fresh directory with no hostile existing links: this
+/// function creates missing directories but does not require an empty target.
+/// Validation errors precede extraction; extraction I/O errors can leave partial
+/// output. No signature, Git object, or signed-ref verification is performed here.
 pub fn unpack_directory(bytes: &[u8], root: &Path) -> Result<()> {
     if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
         bail!("snapshot exceeds size limit");
