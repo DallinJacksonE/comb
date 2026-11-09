@@ -2,6 +2,23 @@
 
 An executable local-first Git collaboration prototype. **Not audited or ready for sensitive production code.** The agreed target design is [system/readme.md](system/readme.md); implemented behavior and limits are documented here rather than implied by the design.
 
+## License and contributions
+
+COMB's original project code is licensed under **AGPL-3.0-only**; see [LICENSE](LICENSE).
+You may use, modify, self-host, and contribute to it, and charge for managed
+FRAME hosting or GUARD services, subject to the license. Other operators may
+also offer paid hosting. Operators of modified versions that interact with users
+over a network must prominently offer those users the corresponding source at
+no charge, as required by section 13. This licenses COMB itself, not customer
+repositories stored or transported by it. Dependencies retain their own licenses.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) to contribute and
+[OPEN_SOURCE_REVIEW.md](OPEN_SOURCE_REVIEW.md) for hosting limitations and release
+licensing checks. Before a hosted release, provide a prominent source link in
+the deployed interface to the exact running version, including modifications
+and required build material; a link to an unrelated or outdated branch is not
+sufficient.
+
 ## Workspace
 
 | Directory | Implementation |
